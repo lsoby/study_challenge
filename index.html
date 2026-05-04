@@ -375,7 +375,7 @@ const LS = {
 // ─── STATE ───
 let state = {
   user: null, tab: 'dashboard', roomView: null, showCreateRoom: false,
-  showAddSubject: false, historyFilter: 'all',
+  showAddSubject: false, historyFilter: 'all', lbMode: 'total',
   timer: {
     running: false, paused: false,
     elapsed: 0,           // total elapsed seconds (includes paused segments)
@@ -388,33 +388,97 @@ let state = {
   syncListeners: [], syncConnected: false,
 };
 
-// ─── WEEK KEY ───
-function getResetDay(username) {
-  const u = state.users[username || state.user];
-  return (u && u.resetDay !== undefined) ? u.resetDay : 1;
+// ─── PERIOD SYSTEM ───
+// periodMode: 'week' | 'month' | 'custom'
+// periodDays: number (used when mode=custom, or derived for week/month)
+// resetDay: 0-6 (only used when mode='week')
+
+function getUserPeriod(username) {
+  const u = state.users[username || state.user] || {};
+  return {
+    mode:      u.periodMode  || 'week',
+    days:      u.periodDays  || 7,
+    resetDay:  u.resetDay    !== undefined ? u.resetDay : 1,
+  };
 }
-function weekKey(resetDay) {
-  if (resetDay === undefined) resetDay = getResetDay();
-  const now = new Date(), dow = now.getDay();
-  const diff = (dow - resetDay + 7) % 7;
-  const ws = new Date(now); ws.setDate(now.getDate()-diff); ws.setHours(0,0,0,0);
+
+// Returns an ISO date string for the START of the current period
+function periodStartKey(username) {
+  const { mode, days, resetDay } = getUserPeriod(username);
+  const now = new Date();
+  now.setHours(0,0,0,0);
+
+  if (mode === 'week') {
+    const dow  = now.getDay();
+    const diff = (dow - resetDay + 7) % 7;
+    const ws   = new Date(now); ws.setDate(now.getDate() - diff);
+    return ws.toISOString().slice(0,10);
+  }
+  if (mode === 'month') {
+    // calendar month: 1st of current month
+    return new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0,10);
+  }
+  // custom N days: rolling window starting N days ago
+  const ws = new Date(now); ws.setDate(now.getDate() - (days - 1));
   return ws.toISOString().slice(0,10);
 }
 
-// ─── HOURS CALCS ───
-function getUserWeekHours(username) {
-  const rd = getResetDay(username), wk = weekKey(rd);
-  const us = state.sessions[username]; if (!us) return 0;
-  let t = 0;
-  Object.values(us).forEach(s => { if(s.week===wk) t+=s.duration; });
-  return Math.round(t*10)/10;
+// Human-readable period label
+function periodLabel(username) {
+  const { mode, days, resetDay } = getUserPeriod(username);
+  if (mode === 'week')   return `Resets every ${DAYS_FULL[resetDay]}`;
+  if (mode === 'month')  return 'Resets 1st of each month';
+  return `Rolling ${days}-day window`;
 }
-function getUserSubjectHours(username, subjectId) {
-  const rd = getResetDay(username), wk = weekKey(rd);
+
+function periodShortLabel(username) {
+  const { mode, days } = getUserPeriod(username);
+  if (mode === 'week')   return 'This week';
+  if (mode === 'month')  return 'This month';
+  return `Last ${days} days`;
+}
+
+// Legacy alias — still used internally for session tagging
+function getResetDay(username) {
+  return getUserPeriod(username).resetDay;
+}
+function weekKey(resetDay) {
+  // kept for session write compat; just returns period start
+  return periodStartKey(state.user);
+}
+
+// ─── HOURS CALCS ───
+function getUserPeriodHours(username) {
+  const start = periodStartKey(username);
   const us = state.sessions[username]; if (!us) return 0;
   let t = 0;
-  Object.values(us).forEach(s => { if(s.week===wk && s.subjectId===subjectId) t+=s.duration; });
-  return Math.round(t*10)/10;
+  Object.values(us).forEach(s => {
+    // Support both week-tagged sessions and day-tagged sessions
+    const inPeriod = s.week === start || (s.day && s.day >= start);
+    if (inPeriod) t += s.duration;
+  });
+  return Math.round(t * 10) / 10;
+}
+// alias used throughout
+function getUserWeekHours(username) { return getUserPeriodHours(username); }
+
+function getUserSubjectHours(username, subjectId) {
+  const start = periodStartKey(username);
+  const us = state.sessions[username]; if (!us) return 0;
+  let t = 0;
+  Object.values(us).forEach(s => {
+    const inPeriod = s.week === start || (s.day && s.day >= start);
+    if (inPeriod && s.subjectId === subjectId) t += s.duration;
+  });
+  return Math.round(t * 10) / 10;
+}
+
+// All-time total hours (for leaderboard)
+function getUserTotalHours(username) {
+  const us = state.sessions[username]; if (!us) return 0;
+  let t = 0;
+  Object.values(us).forEach(s => { t += s.duration; });
+  return Math.round(t * 10) / 10;
 }
 function getUserDayHours(username, dayOffset) {
   const dk = dayKey(dayOffset);
@@ -427,7 +491,9 @@ function getUserDailyGoal(username) {
   const u = state.users[username];
   if (!u) return null;
   if (u.dailyGoal !== undefined) return u.dailyGoal;
-  return Math.round((u.goal||40) / 7 * 10) / 10;
+  const { mode, days } = getUserPeriod(username);
+  const periodLen = mode === 'month' ? 30 : days;
+  return Math.round((u.goal || 40) / periodLen * 10) / 10;
 }
 function getSubjects(username) {
   const u = state.users[username]; if (!u) return [];
@@ -488,8 +554,8 @@ function refreshView() {
 
 // ─── SESSION LOG ───
 async function logSession(username, duration, label, subjectId) {
-  const rd = getResetDay(username);
-  const entry = { duration, label, subjectId: subjectId||null, week: weekKey(rd), day: dayKey(), ts: Date.now() };
+  const periodStart = periodStartKey(username);
+  const entry = { duration, label, subjectId: subjectId||null, week: periodStart, day: dayKey(), ts: Date.now() };
   const key = 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2,5);
   const ok = await fbSet(`sessions/${username}/${key}`, entry);
   if (!ok) {
@@ -513,7 +579,7 @@ async function signup(username, displayName, password, goal, resetDay) {
   let ex = await fbGet(`users/${username}`);
   if (!ex) { const l=LS.get('users')||{}; ex=l[username]; }
   if (ex) return { ok:false, err:'Username already taken.' };
-  const user = { username, displayName, password, goal:goal||40, resetDay:resetDay!==undefined?resetDay:1, dailyGoal:null, subjects:[], createdAt:Date.now() };
+  const user = { username, displayName, password, goal:goal||40, resetDay:resetDay!==undefined?resetDay:1, periodMode:'week', periodDays:7, dailyGoal:null, subjects:[], createdAt:Date.now() };
   const ok = await fbSet(`users/${username}`, user);
   if (!ok) { const l=LS.get('users')||{}; l[username]=user; LS.set('users',l); }
   return { ok:true, user };
@@ -741,15 +807,15 @@ function renderDashboard() {
 
   return `
   <div class="stats-grid">
-    <div class="stat-card"><div class="stat-val" style="color:#6c8fff">${fmtHrs(weekHrs)}</div><div class="stat-lbl">This week</div><div class="stat-sub">Goal: ${goal}h</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:#6c8fff">${fmtHrs(weekHrs)}</div><div class="stat-lbl">${periodShortLabel(state.user)}</div><div class="stat-sub">Goal: ${goal}h</div></div>
     <div class="stat-card"><div class="stat-val" style="color:${pct>=100?'#3ecf8e':'#f5a623'}">${pct}%</div><div class="stat-lbl">Progress</div><div class="stat-sub">${statusPill}</div></div>
     <div class="stat-card"><div class="stat-val" style="color:#a78bfa">${remaining>0?fmtHrs(remaining):'—'}</div><div class="stat-lbl">Remaining</div><div class="stat-sub">${remaining>0?'to reach goal':'Goal complete!'}</div></div>
   </div>
 
   <div class="goal-bar-wrap">
-    <div class="section-title">Weekly goal <span class="live-badge"><span class="live-dot"></span>LIVE</span></div>
+    <div class="section-title">${periodShortLabel(state.user)} goal <span class="live-badge"><span class="live-dot"></span>LIVE</span></div>
     <div class="goal-bar-bg"><div class="goal-bar-fill" style="width:${pct}%;background:${barColor}"></div></div>
-    <div class="goal-info"><span>${fmtHrs(weekHrs)} studied</span><span>${goal}h goal · resets ${DAYS_FULL[resetDay]}</span></div>
+    <div class="goal-info"><span>${fmtHrs(weekHrs)} studied</span><span>${goal}h goal · ${periodLabel(state.user)}</span></div>
   </div>
 
   <div class="daily-card">
@@ -853,7 +919,7 @@ function renderRoomDetail(roomId) {
   return `<div class="room-detail">
     <div class="room-detail-header">
       <div><div class="room-detail-title">${esc(room.name)} <span class="live-badge"><span class="live-dot"></span>LIVE</span></div>
-      <div style="font-size:12px;color:var(--text2)">${allM.length} member${allM.length!==1?'s':''} · Weekly leaderboard</div></div>
+      <div style="font-size:12px;color:var(--text2)">${allM.length} member${allM.length!==1?'s':''} · Period leaderboard</div></div>
       <button class="btn-back" onclick="window.closeRoom()">← Back</button>
     </div>
     ${rows}${inv}${leaveBtn}
@@ -864,46 +930,61 @@ function renderRoomDetail(roomId) {
 function renderLeaderboard() {
   const allUsers = Object.values(state.users);
   if (allUsers.length === 0) return '<div class="empty">No users yet.</div>';
+  const lbMode = state.lbMode || 'total'; // 'total' | 'period'
 
-  const ranked = allUsers.map(u=>{
-    const wh = getUserWeekHours(u.username);
-    const g = u.goal||40;
-    const pct = Math.round(wh/g*100);
-    return { ...u, wh, pct };
-  }).sort((a,b)=>b.wh-a.wh);
+  const ranked = allUsers.map(u => {
+    const totalHrs  = getUserTotalHours(u.username);
+    const periodHrs = getUserPeriodHours(u.username);
+    const sortHrs   = lbMode === 'total' ? totalHrs : periodHrs;
+    const g = u.goal || 40;
+    return { ...u, totalHrs, periodHrs, sortHrs, pct: Math.round(periodHrs / g * 100) };
+  }).sort((a, b) => b.sortHrs - a.sortHrs);
 
-  const maxHrs = Math.max(...ranked.map(r=>r.wh),0.01);
+  const maxHrs = Math.max(...ranked.map(r => r.sortHrs), 0.01);
+  const myData = ranked.find(u => u.username === state.user);
+  const myRank = ranked.findIndex(u => u.username === state.user) + 1;
 
-  let rows = ranked.map((u,idx)=>{
-    const isMe = u.username===state.user;
-    const bc = u.pct>=100?'#3ecf8e':u.pct>=60?'#6c8fff':u.pct>=30?'#f5a623':'#ef4444';
-    const rankClass = idx===0?'gold':idx===1?'silver':idx===2?'bronze':'';
-    const rankLabel = idx===0?'🥇':idx===1?'🥈':idx===2?'🥉':`#${idx+1}`;
-    const barW = Math.round(u.wh/maxHrs*100);
-    return `<div class="lb-row ${isMe?'lb-me':''}">
+  let rows = ranked.map((u, idx) => {
+    const isMe = u.username === state.user;
+    const displayHrs = lbMode === 'total' ? u.totalHrs : u.periodHrs;
+    const bc = u.pct >= 100 ? '#3ecf8e' : u.pct >= 60 ? '#6c8fff' : u.pct >= 30 ? '#f5a623' : '#ef4444';
+    const barColor = lbMode === 'total' ? '#6c8fff' : bc;
+    const rankClass = idx === 0 ? 'gold' : idx === 1 ? 'silver' : idx === 2 ? 'bronze' : '';
+    const rankLabel = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `#${idx + 1}`;
+    const barW = Math.round(displayHrs / maxHrs * 100);
+    const sub = lbMode === 'total'
+      ? `All time · ${periodShortLabel(u.username)}: ${fmtHrs(u.periodHrs)}`
+      : `Goal: ${u.goal || 40}h · ${periodShortLabel(u.username)}`;
+    return `<div class="lb-row ${isMe ? 'lb-me' : ''}">
       <div class="lb-rank ${rankClass}">${rankLabel}</div>
       <div class="lb-avatar" style="background:${getGrad(u.username)}">${getInitials(u.displayName)}</div>
       <div class="lb-info">
-        <div class="lb-name">${esc(u.displayName)}${isMe?' <span style="color:var(--text3);font-size:10px">(you)</span>':''}</div>
-        <div class="lb-sub">Goal: ${u.goal||40}h/week</div>
-        <div class="lb-bar-bg"><div class="lb-bar" style="width:${barW}%;background:${bc}"></div></div>
+        <div class="lb-name">${esc(u.displayName)}${isMe ? ' <span style="color:var(--text3);font-size:10px">(you)</span>' : ''}</div>
+        <div class="lb-sub">${sub}</div>
+        <div class="lb-bar-bg"><div class="lb-bar" style="width:${barW}%;background:${barColor}"></div></div>
       </div>
       <div class="lb-right">
-        <div class="lb-hrs" style="color:${bc}">${fmtHrs(u.wh)}</div>
-        <div class="lb-pct">${u.pct}%</div>
+        <div class="lb-hrs" style="color:${barColor}">${fmtHrs(displayHrs)}</div>
+        <div class="lb-pct">${lbMode === 'total' ? 'total' : u.pct + '%'}</div>
       </div>
     </div>`;
   }).join('');
 
-  const myRank = ranked.findIndex(u=>u.username===state.user)+1;
-  const myData = ranked.find(u=>u.username===state.user);
+  const myPeriodHrs = myData ? myData.periodHrs : 0;
+  const myTotalHrs  = myData ? myData.totalHrs  : 0;
 
   return `
-  <div class="section-title">Global leaderboard <span class="live-badge"><span class="live-dot"></span>LIVE</span></div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+    <div class="section-title" style="margin-bottom:0">Global leaderboard <span class="live-badge"><span class="live-dot"></span>LIVE</span></div>
+    <div style="display:flex;gap:4px;background:var(--bg3);border-radius:8px;padding:3px">
+      <div style="padding:5px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;${lbMode==='total'?'background:var(--bg4);color:var(--text)':'color:var(--text2)'}" onclick="window.setLbMode('total')">All time</div>
+      <div style="padding:5px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;${lbMode==='period'?'background:var(--bg4);color:var(--text)':'color:var(--text2)'}" onclick="window.setLbMode('period')">This period</div>
+    </div>
+  </div>
   <div class="stats-grid" style="margin-bottom:20px">
     <div class="stat-card"><div class="stat-val" style="color:#ffd700">#${myRank}</div><div class="stat-lbl">Your rank</div><div class="stat-sub">of ${ranked.length} users</div></div>
-    <div class="stat-card"><div class="stat-val" style="color:#6c8fff">${fmtHrs(myData?myData.wh:0)}</div><div class="stat-lbl">Your hours</div><div class="stat-sub">this week</div></div>
-    <div class="stat-card"><div class="stat-val" style="color:#3ecf8e">${ranked.length>0?fmtHrs(ranked[0].wh):'—'}</div><div class="stat-lbl">Top score</div><div class="stat-sub">${ranked.length>0?esc(ranked[0].displayName):''}</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:#6c8fff">${fmtHrs(myTotalHrs)}</div><div class="stat-lbl">All-time hours</div><div class="stat-sub">${fmtHrs(myPeriodHrs)} this period</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:#3ecf8e">${ranked.length > 0 ? fmtHrs(ranked[0].sortHrs) : '—'}</div><div class="stat-lbl">Top score</div><div class="stat-sub">${ranked.length > 0 ? esc(ranked[0].displayName) : ''}</div></div>
   </div>
   <div class="session-log-wrap">${rows}</div>`;
 }
@@ -967,9 +1048,7 @@ function renderSettings() {
     </div>`
   ).join('');
 
-  const resetOpts=DAYS_SHORT.map((d,i)=>
-    `<div class="reset-day-opt ${resetDay===i?'selected':''}" onclick="window.setResetDay(${i})">${d}</div>`
-  ).join('');
+  // resetOpts now inlined in period card
 
   const subjectList=subjects.length===0
     ? '<div class="empty" style="padding:16px">No subjects yet. Add them from the Dashboard!</div>'
@@ -993,9 +1072,38 @@ function renderSettings() {
     <div id="goal-msg" class="msg"></div>
   </div>
   <div class="settings-card">
-    <div class="settings-title">Week reset day</div>
-    <div style="font-size:12px;color:var(--text2);margin-bottom:14px">Your weekly hours reset at midnight on the chosen day.</div>
-    <div class="reset-day-grid">${resetOpts}</div>
+    <div class="settings-title">Reset period</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:16px">Choose how long your study period lasts before stats reset.</div>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:16px">
+      <div style="padding:14px;background:var(--bg3);border:0.5px solid ${(state.users[state.user]||{}).periodMode==='week'?'var(--accent)':'var(--border)'};border-radius:10px;cursor:pointer;transition:all .2s;text-align:center${(state.users[state.user]||{}).periodMode==='week'?';background:rgba(108,143,255,0.1)':''}" onclick="window.setPeriodMode('week')">
+        <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:${(state.users[state.user]||{}).periodMode==='week'?'var(--accent)':'var(--text)'}">7</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">days (week)</div>
+      </div>
+      <div style="padding:14px;background:var(--bg3);border:0.5px solid ${(state.users[state.user]||{}).periodMode==='month'?'var(--accent)':'var(--border)'};border-radius:10px;cursor:pointer;transition:all .2s;text-align:center${(state.users[state.user]||{}).periodMode==='month'?';background:rgba(108,143,255,0.1)':''}" onclick="window.setPeriodMode('month')">
+        <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:${(state.users[state.user]||{}).periodMode==='month'?'var(--accent)':'var(--text)'}">~30</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">days (month)</div>
+      </div>
+      <div style="padding:14px;background:var(--bg3);border:0.5px solid ${(state.users[state.user]||{}).periodMode==='custom'&&(state.users[state.user]||{}).periodDays===21?'var(--accent)':'var(--border)'};border-radius:10px;cursor:pointer;transition:all .2s;text-align:center${(state.users[state.user]||{}).periodMode==='custom'&&(state.users[state.user]||{}).periodDays===21?';background:rgba(108,143,255,0.1)':''}" onclick="window.setPeriodCustom(21)">
+        <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:${(state.users[state.user]||{}).periodMode==='custom'&&(state.users[state.user]||{}).periodDays===21?'var(--accent)':'var(--text)'}">21</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">days</div>
+      </div>
+      <div style="padding:14px;background:var(--bg3);border:0.5px solid ${(state.users[state.user]||{}).periodMode==='custom'&&(state.users[state.user]||{}).periodDays===14?'var(--accent)':'var(--border)'};border-radius:10px;cursor:pointer;transition:all .2s;text-align:center${(state.users[state.user]||{}).periodMode==='custom'&&(state.users[state.user]||{}).periodDays===14?';background:rgba(108,143,255,0.1)':''}" onclick="window.setPeriodCustom(14)">
+        <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:${(state.users[state.user]||{}).periodMode==='custom'&&(state.users[state.user]||{}).periodDays===14?'var(--accent)':'var(--text)'}">14</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">days (2 weeks)</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <span style="font-size:12px;color:var(--text2)">Custom days:</span>
+      <input id="custom-period-days" type="number" min="1" max="365" value="${(state.users[state.user]||{}).periodDays||7}" style="width:70px;background:var(--bg3);border:0.5px solid var(--border2);border-radius:7px;padding:7px 8px;color:var(--text);font-family:var(--mono);font-size:16px;font-weight:700;text-align:center;outline:none">
+      <button class="btn-sm" onclick="window.saveCustomPeriod()">Set</button>
+    </div>
+    ${(state.users[state.user]||{}).periodMode==='week' ? `
+    <div style="font-size:12px;color:var(--text2);margin-bottom:10px">Which day the week resets:</div>
+    <div class="reset-day-grid">${DAYS_SHORT.map((d,i)=>`<div class="reset-day-opt ${resetDay===i?'selected':''}" onclick="window.setResetDay(${i})">${d}</div>`).join('')}</div>
+    ` : ''}
+    <div style="font-size:12px;color:var(--text3);margin-top:10px;padding:10px;background:var(--bg3);border-radius:8px">
+      Current period: <strong style="color:var(--text2)">${periodLabel(state.user)}</strong>
+    </div>
     <div id="reset-msg" class="msg"></div>
   </div>
   <div class="settings-card">
@@ -1321,6 +1429,29 @@ window.deleteRoom = async roomId => {
   if (!confirm('Delete this room?')) return;
   await fbRemove(`rooms/${roomId}`); delete state.rooms[roomId];
   state.roomView=null; showNotif('Room deleted.'); renderMain();
+};
+
+// ─── PERIOD ACTIONS ───
+window.setLbMode = m => { state.lbMode = m; renderMain(); };
+
+window.setPeriodMode = async mode => {
+  const days = mode === 'week' ? 7 : mode === 'month' ? 30 : (state.users[state.user]||{}).periodDays || 7;
+  await fbUpdate(`users/${state.user}`, { periodMode: mode, periodDays: days });
+  if (state.users[state.user]) { state.users[state.user].periodMode = mode; state.users[state.user].periodDays = days; }
+  showNotif(`Period set to ${mode}`); renderMain();
+};
+
+window.setPeriodCustom = async days => {
+  await fbUpdate(`users/${state.user}`, { periodMode: 'custom', periodDays: days });
+  if (state.users[state.user]) { state.users[state.user].periodMode = 'custom'; state.users[state.user].periodDays = days; }
+  showNotif(`Period set to ${days} days`); renderMain();
+};
+
+window.saveCustomPeriod = async () => {
+  const inp = document.getElementById('custom-period-days');
+  const d = parseInt(inp ? inp.value : 0);
+  if (!d || d < 1 || d > 365) { showNotif('Enter 1–365 days', 'err'); return; }
+  await window.setPeriodCustom(d);
 };
 
 // ─── NOTIF ───
